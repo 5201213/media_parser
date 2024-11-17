@@ -1,0 +1,41 @@
+{
+    "name": "视频图集解析插件",
+    "description": "解析支持平台的视频和图集链接，提取相关信息。",
+    "supported_platforms": [
+        "抖音",
+        "快手",
+        "小红书",
+        "皮皮虾",
+        "西瓜视频",
+        "最右",
+        "火山",
+        "微博",
+        "微视",
+        "绿洲",
+        "bilibili",
+        "陌陌",
+        "全民视频",
+        "全民K歌",
+        "逗拍",
+        "美拍",
+        "六间房",
+        "梨视频",
+        "虎牙",
+        "新片场",
+        "AcFun"
+    ],
+    "commands": [
+        {
+            "trigger": "解析视频",
+            "description": "解析视频链接，获取视频详情。"
+        },
+        {
+            "trigger": "解析图集",
+            "description": "解析图集链接，获取图片详情。"
+        }
+    ],
+    "api_endpoints": {
+        "video": "https://www.hhlqilongzhu.cn/api/sp_jx/sp.php",
+        "image": "https://www.hhlqilongzhu.cn/api/sp_jx/tuji.php"
+    }
+}
