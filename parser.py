@@ -433,89 +433,85 @@ class MediaParserPlugin(Plugin):
                 logger.error(f"[MediaParser] 未知错误: {e}")
                 return None
 
-    def download_media(self, url, media_type):
-        """下载媒体文件，并返回文件对象和文件名"""
+    def download_media(self, url, media_type="video"):
+        """
+        下载媒体文件，支持视频和图片
+        
+        :param url: 媒体文件的下载地址
+        :param media_type: 媒体类型，默认为视频
+        :return: 文件对象和文件名，下载失败返回 (None, None)
+        """
         try:
-            # 发起请求，获取响应
-            response = self._make_request("GET", url, stream=True)
+            import os
+            import requests
+            import mimetypes
+            from urllib.parse import urlparse
             
-            if response is None:
-                logger.error(f"[MediaParser] 下载失败：无法获取响应 (URL: {url})")
-                return None, None
+            # 检查缓存大小
+            self._check_cache_size()
             
-            # 检查内容类型
-            content_type = response.headers.get('Content-Type', '').lower()
-            logger.debug(f"[MediaParser] 内容类型: {content_type}")
+            # 生成唯一文件名
+            parsed_url = urlparse(url)
+            file_extension = os.path.splitext(parsed_url.path)[-1] or ('.mp4' if media_type == 'video' else '.jpg')
+            filename = f"{int(time.time())}_{hash(url)}{file_extension}"
+            filepath = os.path.join(self.cache_dir, filename)
             
-            # 验证媒体类型
-            if media_type == "video":
-                ext = self.video_extensions.get(content_type, '.mp4')
-                mime_type = content_type or 'video/mp4'
-                if "video" not in content_type:
-                    logger.warning(f"[MediaParser] 不是视频内容: {content_type}")
-            else:
-                ext = self.image_extensions.get(content_type, '.jpg')
-                mime_type = content_type or 'image/jpeg'
-                if "image" not in content_type:
-                    logger.warning(f"[MediaParser] 不是图片内容: {content_type}")
+            # 设置更复杂的请求头，模拟浏览器行为
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
+                'Referer': parsed_url.scheme + '://' + parsed_url.netloc,
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
             
-            # 使用URL的MD5作为文件名
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-            filename = f"{int(time.time())}_{url_hash}"
-            
-            # 下载文件内容到内存
-            file_content = response.content
-            
-            # 记录文件大小和类型
-            logger.debug(f"[MediaParser] 文件大小: {len(file_content)} 字节")
-            logger.debug(f"[MediaParser] 文件扩展名: {ext}")
-            
-            # 如果是 WebP 格式，转换为 PNG
-            if ext == '.webp':
+            # 尝试多次下载
+            for attempt in range(self.config["download"]["max_retries"]):
                 try:
-                    from PIL import Image
-                    import io
+                    response = requests.get(
+                        url, 
+                        headers=headers, 
+                        stream=True, 
+                        timeout=self.config["download"]["timeout"]
+                    )
                     
-                    # 使用 Pillow 转换 WebP 到 PNG
-                    with Image.open(io.BytesIO(file_content)) as img:
-                        png_buffer = io.BytesIO()
-                        img.save(png_buffer, format='PNG')
-                        file_content = png_buffer.getvalue()
+                    # 检查响应状态码
+                    if response.status_code == 403:
+                        logger.warning(f"[MediaParser] 第 {attempt + 1} 次请求失败，状态码: 403")
+                        time.sleep(self.config["download"]["retry_delay"])
+                        continue
                     
-                    ext = '.png'
-                    logger.info("[MediaParser] 成功将 WebP 转换为 PNG")
-                except ImportError:
-                    logger.warning("[MediaParser] Pillow 未安装，无法转换 WebP")
-                except Exception as convert_error:
-                    logger.error(f"[MediaParser] WebP 转换失败: {convert_error}")
-            
-            # 完整文件名
-            full_filename = filename + ext
-            
-            # 创建一个新的 BytesIO 对象用于发送
-            file_obj = BytesIO(file_content)
-            
-            # 设置文件对象的属性
-            file_obj.name = full_filename
-            
-            # 保存到文件系统作为缓存
-            filepath = os.path.join(self.cache_dir, full_filename)
-            with open(filepath, 'wb') as f:
-                f.write(file_content)
-            
-            # 保存文件路径以便后续清理
-            setattr(file_obj, '_filepath', filepath)
-            
-            # 记录文件详细信息
-            logger.info(f"[MediaParser] 文件下载成功: {full_filename}")
-            logger.info(f"[MediaParser] 文件路径: {filepath}")
-            logger.info(f"[MediaParser] MIME类型: {mime_type}")
-            
-            return file_obj, full_filename
+                    response.raise_for_status()  # 抛出异常处理其他错误状态码
+                    
+                    # 检测MIME类型
+                    content_type = response.headers.get('Content-Type', '')
+                    logger.info(f"[MediaParser] 文件MIME类型: {content_type}")
+                    
+                    # 写入文件
+                    with open(filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=self.config["cache"]["chunk_size"]):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    # 文件下载成功
+                    logger.info(f"[MediaParser] 文件下载成功: {filename}")
+                    logger.info(f"[MediaParser] 文件路径: {filepath}")
+                    
+                    # 返回文件对象
+                    return open(filepath, 'rb'), filename
                 
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"[MediaParser] 下载尝试 {attempt + 1} 失败: {e}")
+                    time.sleep(self.config["download"]["retry_delay"])
+            
+            # 如果所有尝试都失败
+            logger.error("[MediaParser] 视频下载失败：所有重试都未成功")
+            return None, None
+        
         except Exception as e:
-            logger.error(f"[MediaParser] 下载失败: {e}")
-            logger.exception("详细错误追踪:")
+            logger.error(f"[MediaParser] 下载过程中发生未知错误: {e}", exc_info=True)
             return None, None
 
     def close_file(self, file_obj):
