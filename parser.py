@@ -90,7 +90,8 @@ class MediaParserPlugin(Plugin):
             "batch": {
                 "image_limit": 10,  # 每批最多发送的图片数
                 "delay_seconds": 2   # 批次间延迟时间
-            }
+            },
+            "max_video_size_mb": 20  # 视频最大大小（MB）
         }
         
         try:
@@ -124,6 +125,7 @@ class MediaParserPlugin(Plugin):
             assert isinstance(self.config["download"]["retry_delay"], (int, float)) and self.config["download"]["retry_delay"] >= 0, "重试延迟配置错误"
             assert isinstance(self.config["batch"]["image_limit"], int) and self.config["batch"]["image_limit"] > 0, "图集批量发送限制配置错误"
             assert isinstance(self.config["batch"]["delay_seconds"], (int, float)) and self.config["batch"]["delay_seconds"] >= 0, "批次延迟时间配置错误"
+            assert isinstance(self.config["max_video_size_mb"], (int, float)) and self.config["max_video_size_mb"] > 0, "视频最大大小配置错误"
             logger.info("[MediaParser] 配置文件验证通过")
         except AssertionError as e:
             logger.error(f"[MediaParser] 配置文件验证失败: {e}")
@@ -167,6 +169,7 @@ class MediaParserPlugin(Plugin):
             return
 
         content = e_context['context'].content.strip()
+        logger.info(f"[MediaParser] 收到消息: {content}")
         
         if content == "清理缓存":
             result = self.clean_cache()
@@ -185,6 +188,8 @@ class MediaParserPlugin(Plugin):
             command = "解析视频" if content.startswith("解析视频") else "解析图集"
             url = content[len(command):].strip()
             
+            logger.info(f"[MediaParser] 解析命令: {command}, URL: {url}")
+            
             if not url:
                 e_context['reply'] = Reply(ReplyType.TEXT, f"请提供要解析的链接\n例如：{command} <链接>")
                 e_context.action = EventAction.BREAK_PASS
@@ -193,36 +198,56 @@ class MediaParserPlugin(Plugin):
             # 获取接收者信息
             receiver = e_context['context'].kwargs.get('receiver')
             if not receiver:
+                logger.error("[MediaParser] 无法获取接收者信息")
                 e_context['reply'] = Reply(ReplyType.TEXT, "无法获取接收者信息")
                 e_context.action = EventAction.BREAK_PASS
                 return
             
+            logger.info(f"[MediaParser] 开始处理，接收者: {receiver}")
+            
             try:
+                # 提取链接中的URL
+                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+                urls = re.findall(url_pattern, url)
+                
+                if not urls:
+                    # 尝试从文本中提取分享链接
+                    share_pattern = r'复制打开抖音|快手|微博|小红书.*?(?:https?://[^\s]+)'
+                    share_match = re.search(share_pattern, url)
+                    if share_match:
+                        share_text = share_match.group(0)
+                        urls = re.findall(url_pattern, share_text)
+                
+                if not urls:
+                    logger.error(f"[MediaParser] 未找到有效链接: {url}")
+                    e_context['reply'] = Reply(ReplyType.TEXT, "未找到有效的链接，请确保链接格式正确")
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                target_url = urls[0]
+                logger.info(f"[MediaParser] 提取到链接: {target_url}")
+                
                 if command == "解析视频":
-                    reply = self.parse_video(url)
+                    replies = self.parse_video(target_url)
                 else:
-                    # 将接收者信息存储在任务中
                     task_id = f"{receiver}_{int(time.time())}"
-                    reply = self.parse_images(url, task_id)
+                    replies = self.parse_images(target_url, task_id)
                 
                 # 确保回复被正确发送
-                if isinstance(reply, list):
-                    # 批量发送的情况
-                    if reply:
-                        # 逐个发送回复
-                        for r in reply:
-                            logger.info(f"[MediaParser] 准备发送批量回复: {r}")
-                            self.send_to_channel(r, receiver)
+                if isinstance(replies, list) and replies:
+                    # 将第一个回复设置为主回复
+                    e_context['reply'] = replies[0]
+                    # 如果有更多回复，则将它们添加到reply_list中
+                    if len(replies) > 1:
+                        for reply in replies[1:]:
+                            self.send_to_channel(reply, receiver)
                 else:
-                    # 单个回复的情况
-                    logger.info(f"[MediaParser] 准备发送单个回复: {reply}")
-                    self.send_to_channel(reply, receiver)
+                    # 如果只有一个回复或没有回复
+                    e_context['reply'] = replies if replies else Reply(ReplyType.TEXT, "解析失败")
                 
-                # 设置一个空回复，防止重复发送
-                e_context['reply'] = Reply(ReplyType.TEXT, "媒体解析完成")
             except Exception as e:
                 logger.error(f"[MediaParser] 解析失败: {e}", exc_info=True)
-                e_context['reply'] = Reply(ReplyType.TEXT, "解析失败，请稍后重试")
+                e_context['reply'] = Reply(ReplyType.TEXT, "解析失败，请检查链接是否有效")
 
             e_context.action = EventAction.BREAK_PASS
             return
@@ -239,30 +264,38 @@ class MediaParserPlugin(Plugin):
             if not response or response.status_code != 200:
                 msg = f"API请求失败，状态码：{response.status_code}" if response else "API无响应"
                 logger.error(f"[MediaParser] 视频解析API请求失败: {msg}")
-                return Reply(ReplyType.TEXT, msg)
+                return [Reply(ReplyType.TEXT, msg)]
             
             # 解析响应内容
             data = response.json()
             if data.get("code") != 200:
                 error_msg = data.get("msg", "视频解析失败")
                 logger.error(f"[MediaParser] 视频解析失败: {error_msg}")
-                return Reply(ReplyType.TEXT, error_msg)
+                return [Reply(ReplyType.TEXT, error_msg)]
             
             video_data = data.get("data", {})
             if not video_data:
                 logger.error("[MediaParser] 未获取到视频信息")
-                return Reply(ReplyType.TEXT, "未获取到视频信息")
+                return [Reply(ReplyType.TEXT, "未获取到视频信息")]
 
             video_url = video_data.get("url")
             if not video_url:
                 logger.error("[MediaParser] 未找到视频地址")
-                return Reply(ReplyType.TEXT, "未找到视频地址")
+                return [Reply(ReplyType.TEXT, "未找到视频地址")]
             
             self._check_cache_size()
             file_obj, filename = self.download_media(video_url, "video")
             if not file_obj:
                 logger.error("[MediaParser] 视频下载失败")
-                return Reply(ReplyType.TEXT, "视频下载失败")
+                return [Reply(ReplyType.TEXT, "视频下载失败")]
+            
+            # 检查文件大小并返回提示消息
+            file_size = os.path.getsize(os.path.join(self.cache_dir, filename))
+            max_size = self.config["max_video_size_mb"] * 1024 * 1024
+            if file_size > max_size:
+                logger.info(f"[MediaParser] 视频大小为 {file_size/(1024*1024):.2f}MB，返回提示消息")
+                file_obj.close()
+                return [Reply(ReplyType.TEXT, f"抱歉，该视频文件大于{self.config['max_video_size_mb']}MB，暂时无法处理。请尝试分享较小的视频文件。")]
             
             # 构建详细的视频描述
             description_parts = []
@@ -284,18 +317,26 @@ class MediaParserPlugin(Plugin):
             # 组合描述
             description = "\n".join(description_parts)
             
-            # 创建回复
-            reply = Reply(ReplyType.VIDEO, file_obj)
-            reply.filename = filename  # 设置文件名
-            reply.text = description if description_parts else "视频已成功下载"
+            # 创建回复列表
+            replies = []
             
-            logger.info(f"[MediaParser] 视频解析成功，描述：{reply.text}")
+            # 添加描述文本回复
+            if description_parts:
+                text_reply = Reply(ReplyType.TEXT, description)
+                replies.append(text_reply)
             
-            return reply
+            # 添加视频回复
+            video_reply = Reply(ReplyType.VIDEO, file_obj)
+            video_reply.filename = filename
+            replies.append(video_reply)
+            
+            logger.info(f"[MediaParser] 视频解析成功，描述：{description}")
+            
+            return replies
         
         except Exception as e:
             logger.error(f"[MediaParser] 视频解析出错: {e}", exc_info=True)
-            return Reply(ReplyType.TEXT, "视频解析失败，请检查链接是否有效")
+            return [Reply(ReplyType.TEXT, "视频解析失败，请检查链接是否有效")]
 
     def parse_images(self, url, task_id):
         """解析图集链接"""
@@ -408,11 +449,12 @@ class MediaParserPlugin(Plugin):
                 logger.debug(f"[MediaParser] 响应头: {dict(response.headers)}")
                 
                 # 如果是 JSON 请求，记录 JSON 内容
-                try:
-                    json_data = response.json()
-                    logger.debug(f"[MediaParser] 响应 JSON: {json_data}")
-                except Exception as json_error:
-                    logger.debug(f"[MediaParser] 解析 JSON 失败: {json_error}")
+                if not kwargs.get('stream'):  # 只在非流式请求时尝试解析JSON
+                    try:
+                        json_data = response.json()
+                        logger.debug(f"[MediaParser] 响应 JSON: {json_data}")
+                    except Exception as json_error:
+                        logger.debug(f"[MediaParser] 解析 JSON 失败: {json_error}")
                 
                 # 检查响应状态码
                 if response.status_code == 200:
@@ -434,84 +476,63 @@ class MediaParserPlugin(Plugin):
                 return None
 
     def download_media(self, url, media_type="video"):
-        """
-        下载媒体文件，支持视频和图片
-        
-        :param url: 媒体文件的下载地址
-        :param media_type: 媒体类型，默认为视频
-        :return: 文件对象和文件名，下载失败返回 (None, None)
-        """
+        """下载媒体文件，支持视频和图片"""
         try:
-            import os
-            import requests
-            import mimetypes
-            from urllib.parse import urlparse
+            logger.info(f"[MediaParser] 开始下载{media_type}: {url}")
+            response = self._make_request("GET", url, stream=True)
+            if not response:
+                logger.error(f"[MediaParser] 下载失败: 无法获取响应")
+                return None, None
+
+            # 获取Content-Type和文件大小
+            content_type = response.headers.get('content-type', '').lower()
+            content_length = response.headers.get('content-length')
+            logger.info(f"[MediaParser] 文件MIME类型: {content_type}, 预期大小: {content_length} bytes")
             
-            # 检查缓存大小
-            self._check_cache_size()
-            
-            # 生成唯一文件名
-            parsed_url = urlparse(url)
-            file_extension = os.path.splitext(parsed_url.path)[-1] or ('.mp4' if media_type == 'video' else '.jpg')
-            filename = f"{int(time.time())}_{hash(url)}{file_extension}"
+            # 验证Content-Type
+            if media_type == "video" and content_type not in self.video_extensions:
+                logger.error(f"[MediaParser] 不支持的视频类型: {content_type}")
+                return None, None
+            elif media_type == "image" and content_type not in self.image_extensions:
+                logger.error(f"[MediaParser] 不支持的图片类型: {content_type}")
+                return None, None
+
+            # 根据媒体类型选择扩展名
+            if media_type == "video":
+                extension = self.video_extensions.get(content_type, '.mp4')
+            else:
+                extension = self.image_extensions.get(content_type, '.jpg')
+
+            # 使用时间戳和随机数生成唯一文件名
+            filename = f"{int(time.time())}_{hash(url)}{extension}"
             filepath = os.path.join(self.cache_dir, filename)
-            
-            # 设置更复杂的请求头，模拟浏览器行为
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
-                'Referer': parsed_url.scheme + '://' + parsed_url.netloc,
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            }
-            
-            # 尝试多次下载
-            for attempt in range(self.config["download"]["max_retries"]):
-                try:
-                    response = requests.get(
-                        url, 
-                        headers=headers, 
-                        stream=True, 
-                        timeout=self.config["download"]["timeout"]
-                    )
-                    
-                    # 检查响应状态码
-                    if response.status_code == 403:
-                        logger.warning(f"[MediaParser] 第 {attempt + 1} 次请求失败，状态码: 403")
-                        time.sleep(self.config["download"]["retry_delay"])
-                        continue
-                    
-                    response.raise_for_status()  # 抛出异常处理其他错误状态码
-                    
-                    # 检测MIME类型
-                    content_type = response.headers.get('Content-Type', '')
-                    logger.info(f"[MediaParser] 文件MIME类型: {content_type}")
-                    
-                    # 写入文件
-                    with open(filepath, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=self.config["cache"]["chunk_size"]):
-                            if chunk:
-                                f.write(chunk)
-                    
-                    # 文件下载成功
-                    logger.info(f"[MediaParser] 文件下载成功: {filename}")
-                    logger.info(f"[MediaParser] 文件路径: {filepath}")
-                    
-                    # 返回文件对象
-                    return open(filepath, 'rb'), filename
-                
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"[MediaParser] 下载尝试 {attempt + 1} 失败: {e}")
-                    time.sleep(self.config["download"]["retry_delay"])
-            
-            # 如果所有尝试都失败
-            logger.error("[MediaParser] 视频下载失败：所有重试都未成功")
-            return None, None
-        
+
+            # 使用二进制模式写入文件
+            total_size = 0
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=self.config["cache"]["chunk_size"]):
+                    if chunk:
+                        f.write(chunk)
+                        total_size += len(chunk)
+
+            logger.info(f"[MediaParser] 文件下载成功: {filename}")
+            logger.info(f"[MediaParser] 文件路径: {filepath}")
+            logger.info(f"[MediaParser] 文件大小: {self.format_size(total_size)}")
+
+            # 确保文件权限正确
+            try:
+                os.chmod(filepath, 0o644)
+            except Exception as e:
+                logger.warning(f"[MediaParser] 设置文件权限失败: {e}")
+
+            # 打开文件用于读取
+            file_obj = open(filepath, 'rb')
+            return file_obj, filename
+
         except Exception as e:
-            logger.error(f"[MediaParser] 下载过程中发生未知错误: {e}", exc_info=True)
+            logger.error(f"[MediaParser] 下载媒体文件失败: {e}")
+            import traceback
+            logger.error(f"[MediaParser] 错误追踪: {traceback.format_exc()}")
             return None, None
 
     def close_file(self, file_obj):
@@ -533,71 +554,73 @@ class MediaParserPlugin(Plugin):
     def _clear_expired_cache(self):
         """清理过期缓存"""
         try:
-            # 检查缓存目录是否存在
-            if not hasattr(self, 'cache_dir') or not os.path.exists(self.cache_dir):
-                logger.warning("[MediaParser] 缓存目录不存在")
-                return
+            logger.info("[MediaParser] 开始清理过期缓存")
+            max_age = self.config["cache"]["max_age_hours"] * 3600  # 转换为秒
+            current_time = time.time()
+            removed_count = 0
+            removed_size = 0
             
-            # 检查缓存锁是否存在
-            if not hasattr(self, 'cache_lock'):
-                logger.warning("[MediaParser] 缓存锁未初始化，创建新的锁")
-                self.cache_lock = threading.Lock()
+            for filename in os.listdir(self.cache_dir):
+                filepath = os.path.join(self.cache_dir, filename)
+                if os.path.isfile(filepath):
+                    # 检查文件年龄
+                    file_age = current_time - os.path.getctime(filepath)
+                    if file_age > max_age:
+                        try:
+                            size = os.path.getsize(filepath)
+                            os.remove(filepath)
+                            removed_count += 1
+                            removed_size += size
+                            logger.info(f"[MediaParser] 删除过期文件: {filepath}, 年龄: {int(file_age/3600)}小时")
+                        except Exception as e:
+                            logger.error(f"[MediaParser] 删除过期文件失败: {filepath}, 错误: {e}")
             
-            max_age = self.config["cache"]["max_age_hours"] * 3600
-            now = time.time()
-            
-            with self.cache_lock:
-                for f in os.listdir(self.cache_dir):
-                    filepath = os.path.join(self.cache_dir, f)
-                    try:
-                        if os.path.isfile(filepath):
-                            file_age = now - os.path.getctime(filepath)
-                            if file_age > max_age:
-                                try:
-                                    os.remove(filepath)
-                                    logger.debug(f"[MediaParser] 删除过期文件: {f}")
-                                except OSError as remove_error:
-                                    logger.error(f"[MediaParser] 删除文件失败: {remove_error}")
-                    except Exception as file_error:
-                        logger.error(f"[MediaParser] 处理文件 {f} 时出错: {file_error}")
-                            
+            if removed_count > 0:
+                logger.info(f"[MediaParser] 清理完成，删除了 {removed_count} 个文件，总大小: {self.format_size(removed_size)}")
+            else:
+                logger.info("[MediaParser] 没有发现过期文件")
+                
         except Exception as e:
-            logger.error(f"[MediaParser] 清理过期缓存失败: {e}")
-            # 尝试重新初始化缓存锁
-            self.cache_lock = threading.Lock()
+            logger.error(f"[MediaParser] 清理过期缓存失败: {e}", exc_info=True)
 
     def _check_cache_size(self):
         """检查并控制缓存大小"""
         try:
-            max_size = self.config["cache"]["max_size_mb"] * 1024 * 1024
-            with self.cache_lock:
-                files = []
-                total_size = 0
-                for f in os.listdir(self.cache_dir):
-                    filepath = os.path.join(self.cache_dir, f)
-                    if os.path.isfile(filepath):
-                        size = os.path.getsize(filepath)
-                        ctime = os.path.getctime(filepath)
-                        files.append((filepath, size, ctime))
-                        total_size += size
-                        
-                if total_size > max_size:
-                    # 按创建时间排序，删除最老的文件
-                    files.sort(key=lambda x: x[2])
-                    
-                    for filepath, size, _ in files:
-                        try:
-                            os.remove(filepath)
-                            total_size -= size
-                            logger.debug(f"[MediaParser] 删除缓存文件: {os.path.basename(filepath)}")
-                            if total_size <= max_size:
-                                break
-                        except OSError as e:
-                            logger.error(f"[MediaParser] 删除文件失败: {e}")
-                            
+            logger.info("[MediaParser] 开始检查缓存大小")
+            total_size = 0
+            files = []
+            
+            # 获取所有缓存文件信息
+            for filename in os.listdir(self.cache_dir):
+                filepath = os.path.join(self.cache_dir, filename)
+                if os.path.isfile(filepath):
+                    size = os.path.getsize(filepath)
+                    ctime = os.path.getctime(filepath)
+                    files.append((filepath, size, ctime))
+                    total_size += size
+            
+            max_size = self.config["cache"]["max_size_mb"] * 1024 * 1024  # 转换为字节
+            logger.info(f"[MediaParser] 当前缓存大小: {self.format_size(total_size)}, 最大限制: {self.format_size(max_size)}")
+            
+            if total_size > max_size:
+                # 按创建时间排序，删除最旧的文件
+                files.sort(key=lambda x: x[2])  # 按创建时间排序
+                
+                # 删除文件直到缓存大小小于限制
+                while total_size > max_size and files:
+                    filepath, size, _ = files.pop(0)
+                    try:
+                        os.remove(filepath)
+                        total_size -= size
+                        logger.info(f"[MediaParser] 删除缓存文件: {filepath}, 大小: {self.format_size(size)}")
+                    except Exception as e:
+                        logger.error(f"[MediaParser] 删除缓存文件失败: {filepath}, 错误: {e}")
+                
+                logger.info(f"[MediaParser] 清理后的缓存大小: {self.format_size(total_size)}")
+            
         except Exception as e:
-            logger.error(f"[MediaParser] 检查缓存大小失败: {e}")
-
+            logger.error(f"[MediaParser] 检查缓存大小失败: {e}", exc_info=True)
+            
     def clean_cache(self):
         """清理所有缓存"""
         try:
@@ -718,46 +741,50 @@ class MediaParserPlugin(Plugin):
             from bridge.context import Context
             from bridge.reply import ReplyType
             
-            # 记录发送前的详细信息
             logger.info(f"[MediaParser] 准备发送Reply: 类型={reply.type}, 接收者={receiver}")
             
             channel = create_channel("wx")
             if channel:
-                # 创建 Context 对象，设置必要的参数
                 context = Context()
                 context.kwargs = {'receiver': receiver}
                 
-                # 如果是图片或视频类型，先发送文本描述
                 if reply.type in [ReplyType.IMAGE, ReplyType.VIDEO]:
-                    # 检查是否有可用的文本描述
-                    description = getattr(reply, 'text', None)
-                    
-                    if description and isinstance(description, str):
-                        # 先发送文本描述
-                        text_reply = Reply(ReplyType.TEXT, description)
-                        text_reply.receiver = receiver
-                        channel.send(text_reply, context)
-                        logger.info(f"[MediaParser] 发送媒体描述文本: {description}")
+                    # 确保文件存在且可读
+                    if hasattr(reply.content, 'name'):
+                        if not os.path.exists(reply.content.name):
+                            logger.error(f"[MediaParser] 文件不存在: {reply.content.name}")
+                            return
+                        
+                        # 重新打开文件以确保它是可读的
+                        try:
+                            reply.content.close()
+                            reply.content = open(reply.content.name, 'rb')
+                        except Exception as e:
+                            logger.error(f"[MediaParser] 重新打开文件失败: {e}")
+                            return
                 
-                # 发送媒体文件
                 try:
                     channel.send(reply, context)
-                    logger.info(f"[MediaParser] 通过channel发送媒体文件成功: {reply}")
+                    logger.info(f"[MediaParser] 发送成功: {reply}")
                 except Exception as send_error:
-                    logger.error(f"[MediaParser] channel发送媒体文件失败: {send_error}")
-                    # 尝试打印更多诊断信息
+                    logger.error(f"[MediaParser] 发送失败: {send_error}")
                     import traceback
-                    logger.error(f"[MediaParser] 发送媒体文件错误追踪: {traceback.format_exc()}")
-                    raise
+                    logger.error(f"[MediaParser] 错误追踪: {traceback.format_exc()}")
+                finally:
+                    # 确保文件被关闭
+                    if reply.type in [ReplyType.IMAGE, ReplyType.VIDEO]:
+                        try:
+                            reply.content.close()
+                        except:
+                            pass
             else:
                 logger.error("[MediaParser] 未找到微信channel")
                 raise RuntimeError("未找到微信channel")
         
         except Exception as e:
-            logger.error(f"[MediaParser] 发送到channel失败: {e}")
+            logger.error(f"[MediaParser] 发送失败: {e}")
             import traceback
-            logger.error(f"[MediaParser] 详细错误追踪: {traceback.format_exc()}")
-            raise
+            logger.error(f"[MediaParser] 错误追踪: {traceback.format_exc()}")
 
     def clean_up_files(self, reply_list):
         """在所有回复发送完成后关闭文件对象"""
